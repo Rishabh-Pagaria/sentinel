@@ -13,7 +13,7 @@ import sys
 
 # Import cleaning functions from prep_phish_jsonl
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from prep_phish_jsonl import clean_text, find_urls, find_phrases, infer_tactics
+from src.data.prep_phish_jsonl import clean_text, find_urls, find_phrases, infer_tactics
 
 def load_processed_data() -> pd.DataFrame:
     """Load and process the dataset from Hugging Face"""

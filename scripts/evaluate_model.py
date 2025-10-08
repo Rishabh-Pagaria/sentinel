@@ -34,8 +34,21 @@ def load_test_set(jsonl_path: str) -> List[Dict]:
             examples.append(json.loads(line.strip()))
     return examples
 
+def load_adversarial_examples() -> List[Dict]:
+    """Load adversarial examples from JSONL file"""
+    adv_path = "out_jsonl/eval_adv.jsonl"
+    if not os.path.exists(adv_path):
+        print(f"Warning: {adv_path} not found. Please run generate_adversarial.py first.")
+        return []
+    
+    examples = []
+    with open(adv_path, 'r') as f:
+        for line in f:
+            examples.append(json.loads(line.strip()))
+    return examples
+
 def create_adversarial_examples() -> List[Dict]:
-    """Create challenging test cases"""
+    """Create challenging test cases (legacy examples as backup)"""
     return [
         {
             "input": "EMAIL: Dear valued customer, Due to scheduled system maintenance, we need you to verify your account. Please note this is a legitimate request from your bank. Visit https://legitimate-bank.com to verify. Best regards, Your Bank Team",
@@ -69,9 +82,16 @@ async def evaluate_examples(examples: List[Dict], name: str = "Test Set") -> Tup
     print(f"\nEvaluating {name} ({len(examples)} examples)...")
     
     for ex in tqdm(examples):
-        input_text = ex["input"].replace("EMAIL: ", "")
-        true_label = 1 if ex["output"]["label"] == "phish" else 0
-        
+        # Handle both old and new formats
+        if "input" in ex:
+            # Original format
+            input_text = ex["input"].replace("EMAIL: ", "")
+            true_label = 1 if ex["output"]["label"] == "phish" else 0
+        else:
+            # Adversarial format
+            input_text = ex["text"]
+            true_label = 1 if ex["true_label"] == "phish" else 0
+            
         # Time the prediction
         start_time = time.time()
         try:
@@ -157,7 +177,10 @@ async def main():
     test_metrics, test_details = await evaluate_examples(test_examples, "Standard Test Set")
     
     # Evaluate on adversarial examples
-    adv_examples = create_adversarial_examples()
+    adv_examples = load_adversarial_examples()
+    if not adv_examples:
+        print("No adversarial examples found, falling back to legacy examples")
+        adv_examples = create_adversarial_examples()
     adv_metrics, adv_details = await evaluate_examples(adv_examples, "Adversarial Set")
     
     # Plot results

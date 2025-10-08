@@ -1,0 +1,4 @@
+nltk==3.8.1
+deep-translator==1.11.4
+tqdm==4.66.1
+urllib3<2.0.0  # Use older version compatible with LibreSSL
