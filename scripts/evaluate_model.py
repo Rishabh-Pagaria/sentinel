@@ -24,7 +24,7 @@ import asyncio
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import our classification endpoint
-from app import classify_email, EmailRequest
+from src.api.app import classify_email, EmailRequest
 
 def load_test_set(jsonl_path: str) -> List[Dict]:
     """Load test examples from JSONL file"""
