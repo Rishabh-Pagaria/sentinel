@@ -12,12 +12,92 @@ import os
 import sys
 from pathlib import Path
 import json
+import re
+import html
 from dotenv import load_dotenv
+
+# Regular expressions for cleaning (from prep_phish_jsonl)
+SCRIPT_RE = re.compile(r"(?is)<script.*?>.*?</script>")
+STYLE_RE = re.compile(r"(?is)<style.*?>.*?</style>")
+TAG_RE = re.compile(r"(?s)<[^>]+>")
+WS_RE = re.compile(r"\s+")
 
 # Add project root to PYTHONPATH
 project_root = str(Path(__file__).parents[2])  # Go up 2 levels from src/api/
 sys.path.append(project_root)
 from src.data.prep_phish_jsonl import clean_text, find_urls, find_phrases, infer_tactics
+
+
+def sanitize_prompt_input(text: str) -> str:
+    """
+    Sanitize input text to prevent prompt injection attacks.
+    
+    Techniques used:
+    1. Clean HTML/scripts using techniques from prep_phish_jsonl
+    2. Remove common prompt injection markers
+    3. Strip system commands or role-playing attempts
+    4. Remove attempts to override previous instructions
+    5. Escape special characters that might interfere with prompt structure
+    """
+    if not text:
+        return ""
+        
+    # First apply cleaning from prep_phish_jsonl
+    # Unescape HTML entities
+    text = html.unescape(str(text))
+    
+    # Remove scripts, styles, and HTML tags
+    text = SCRIPT_RE.sub(" ", text)
+    text = STYLE_RE.sub(" ", text)
+    text = TAG_RE.sub(" ", text)
+    
+    # Remove potential system command or role override attempts
+    blacklist = [
+        # LLM control attempts
+        "system:", "assistant:", "user:", "human:", 
+        "instructions:", "prompt:", "context:", 
+        "<system>", "</system>", 
+        "<instructions>", "</instructions>",
+        "<prompt>", "</prompt>",
+        
+        # Role override attempts
+        "you are now", "ignore previous", "disregard",
+        "act as", "you must", "you should",
+        "forget", "do not consider", "instead of",
+        
+        # JSON injection attempts
+        '"label":', '"confidence":', '"tactics":',
+        '"evidence":', '"user_tip":', '"output":',
+        
+        # Command injection
+        "```python", "```bash", "```shell",
+        "import ", "print(", "exec(", "eval(",
+    ]
+    
+    # Case-insensitive replacement of blacklisted terms
+    text_lower = text.lower()
+    for term in blacklist:
+        index = text_lower.find(term)
+        while index != -1:
+            # Replace in original text while preserving case
+            text = text[:index] + " " + text[index + len(term):]
+            text_lower = text.lower()
+            index = text_lower.find(term)
+    
+    # Remove markdown code blocks that might contain instructions
+    text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
+    text = re.sub(r'`.*?`', '', text)
+    
+    # Remove excessive whitespace and normalize using prep_phish_jsonl's approach
+    text = WS_RE.sub(" ", text).strip()
+    
+    # Additional safety: ensure no double-encoding attempts
+    text = re.sub(r'\\[nrt"]', ' ', text)  # Remove common escape sequences
+    
+    # Escape special characters that could interfere with JSON
+    text = json.dumps(text)[1:-1]  # Use json.dumps but remove outer quotes
+    
+    return text
 
 
 load_dotenv()  # Load environment variables from .env file
@@ -113,8 +193,8 @@ async def classify_email(request: EmailRequest):
     """
     try:
         # Clean and preprocess the text
-        text = request.text
-        subject = request.subject or ""
+        text = sanitize_prompt_input(request.text)
+        subject = sanitize_prompt_input(request.subject) if request.subject else ""
         cleaned_text = clean_text(text)
         
         # Get initial heuristic analysis
