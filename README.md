@@ -108,3 +108,10 @@ This will:
 - Run adversarial examples
 - Generate performance metrics
 
+## Demo
+Watch our system in action: [Demo Video](https://www.canva.com/design/DAG1SBAbgp4/IBaorwZM_icZSeuJ378Jxg/watch?utm_content=DAG1SBAbgp4&utm_campaign=designshare&utm_medium=link2&utm_source=uniquelinks&utlId=h41f20d003b)
+
+The demo showcases:
+- Real-time email monitoring
+- Phishing detection with explanations
+- Live dashboard updates
