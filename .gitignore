@@ -19,7 +19,6 @@ ENV/
 
 # Project-specific
 data/
-models/
 out_jsonl/
 
 # IDE
