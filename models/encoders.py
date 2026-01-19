@@ -3,24 +3,25 @@
 import os
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict
+import traceback
+import glob
 
 import numpy as np
 import pandas as pd
 import torch
 from datasets import Dataset
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report, accuracy_score, precision_score, recall_score, f1_score
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
     TrainingArguments,
     Trainer,
 )
-import evaluate
 
 
 @dataclass
 class EncoderConfig:
-    model_name: str = "microsoft/deberta-v3-base"
+    model_name: str = "hf_models/deberta-v3-base"  # Use local downloaded model
     max_length: int = 512
     stride: int = 448                 # sliding window => 64 token overlap
     output_dir: str = "artifacts/encoders/deberta-v3-base"
@@ -52,7 +53,7 @@ class DebertaPhishingEncoder:
 
     def load_csv(
         self,
-        csv_path: str = "/scratch/user/rishabh.pagaria/sentinel/data/processed_phishing_data.csv",
+        csv_path: str = "data/processed_phishing_data.csv",
         text_col: str = "cleaned_text",
         label_col: str = "label",
         eval_size: float = 0.1,
@@ -103,17 +104,17 @@ class DebertaPhishingEncoder:
             max_length=self.config.max_length,
             padding=False,
             return_overflowing_tokens=True,
-            stride=self.config.max_length - self.config.stride,
+            stride=self.config.stride,
+            return_tensors=None,
         )
+        
         chunks = []
-        n = len(enc["input_ids"])
-        for i in range(n):
-            chunks.append(
-                {
-                    "input_ids": enc["input_ids"][i],
-                    "attention_mask": enc["attention_mask"][i],
-                }
-            )
+        num_chunks = len(enc["input_ids"])
+        for i in range(num_chunks):
+            chunks.append({
+                "input_ids": enc["input_ids"][i],
+                "attention_mask": enc["attention_mask"][i]
+            })
         return chunks
 
     def _build_dataset(self, df: pd.DataFrame) -> Dataset:
@@ -142,46 +143,71 @@ class DebertaPhishingEncoder:
     @staticmethod
     def _collate_fn(features: List[Dict]) -> Dict[str, torch.Tensor]:
         """
-        Dynamic padding collator for variable-length token lists.
+        Robust collator that handles various data types.
         """
-        max_len = max(len(f["input_ids"]) for f in features)
+        processed = []
+
+        for f in features:
+            ids = f["input_ids"]
+            attn = f["attention_mask"]
+            label = f["labels"]
+
+            # Handle scalar inputs
+            if isinstance(ids, (int, np.integer)):
+                ids = [int(ids)]
+            if isinstance(attn, (int, np.integer)):
+                attn = [int(attn)]
+
+            # Convert numpy arrays/tensors to lists
+            if hasattr(ids, "tolist"):
+                ids = ids.tolist()
+            if hasattr(attn, "tolist"):
+                attn = attn.tolist()
+
+            processed.append({
+                "input_ids": ids,
+                "attention_mask": attn,
+                "labels": int(label),
+            })
+
+        max_len = max(len(p["input_ids"]) for p in processed)
         pad_id = 0
 
         batch_input_ids = []
         batch_attn = []
         labels = []
 
-        for f in features:
-            ids = f["input_ids"]
-            attn = f["attention_mask"]
+        for p in processed:
+            ids = p["input_ids"]
+            attn = p["attention_mask"]
             pad_len = max_len - len(ids)
+
             batch_input_ids.append(ids + [pad_id] * pad_len)
             batch_attn.append(attn + [0] * pad_len)
-            labels.append(f["labels"])
+            labels.append(p["labels"])
 
         return {
-            "input_ids": torch.tensor(batch_input_ids, dtype=torch.long),
-            "attention_mask": torch.tensor(batch_attn, dtype=torch.long),
-            "labels": torch.tensor(labels, dtype=torch.long),
-        }
+        print("[Encoder] Building HF Datasets with sliding-window chunks...", flush=True)
+        train_ds = self._build_dataset(train_df)
+        eval_ds = self._build_dataset(eval_df)
 
-    # ---------------------- Training ---------------------- #
-
-    def train_from_csv(self, csv_path: str):
-        """
-        Main entry: fine-tune DeBERTa from a processed CSV.
-        """
-        print(f"[Encoder] Loading data from: {csv_path}")
-        train_df, eval_df, test_df = self.load_csv(csv_path)
-
-        print("[Encoder] Loading tokenizer & model...")
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.config.model_name,
-            use_fast=False  # Fix for DeBERTa tokenizer issue
+        # Use sklearn metrics directly to avoid evaluate library bugs
+        def compute_metrics(eval_pred):
+            logits, labels = eval_pred
+            preds = np.argmax(logits, axis=-1)
+            
+            return {
+                "accuracy": float(accuracy_score(labels, preds)),
+                "precision": float(precision_score(labels, preds, average='binary', zero_division=0)),
+                "recall": float(recall_score(labels, preds, average='binary', zero_division=0)),
+                "f1": float(f1_score(labels, preds, average='binary', zero_division=0)),
+            }se_fast=False,
+            local_files_only=True,  # Use only local files, don't download
         )
         self.model = AutoModelForSequenceClassification.from_pretrained(
             self.config.model_name,
             num_labels=2,
+            local_files_only=True,  # Use only local files, don't download
         )
 
         print("[Encoder] Building HF Datasets with sliding-window chunks...")
@@ -209,10 +235,20 @@ class DebertaPhishingEncoder:
             per_device_train_batch_size=self.config.train_batch_size,
             per_device_eval_batch_size=self.config.eval_batch_size,
             num_train_epochs=self.config.num_train_epochs,
-            weight_decay=self.config.weight_decay,
-            evaluation_strategy="steps",
-            eval_steps=500,
-            logging_steps=100,
+        print("[Encoder] Starting training...", flush=True)
+        
+        # Check if checkpoint exists to resume training
+        checkpoints = glob.glob(f"{self.config.output_dir}/checkpoint-*")
+        resume_from_checkpoint = None
+        if checkpoints:
+            latest_checkpoint = sorted(checkpoints, key=lambda x: int(x.split("-")[-1]))[-1]
+            print(f"[Encoder] Found checkpoint: {latest_checkpoint}", flush=True)
+            print(f"[Encoder] Resuming training from checkpoint...", flush=True)
+            resume_from_checkpoint = latest_checkpoint
+        
+        trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+
+        print("[Encoder] Saving model & tokenizer...", flush=True)
             save_strategy="steps",
             save_steps=500,
             load_best_model_at_end=True,
