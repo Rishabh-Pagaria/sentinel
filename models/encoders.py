@@ -11,19 +11,21 @@ import torch
 from torch.utils.data import Dataset as TorchDataset
 from sklearn.metrics import classification_report, accuracy_score, precision_score, recall_score, f1_score
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, TrainingArguments, Trainer
+from transformers import DebertaV2Tokenizer
 
 
 @dataclass
 class EncoderConfig:
-    model_name: str = "hf_models/deberta-v3-base"    # <--- local model folder
-    max_length: int = 512
+    model_name: str = "microsoft/deberta-v3-base"   # <--- local model folder
+    max_length: int = 256  # Reduced from 512 for GPU memory
     stride: int = 64                                 # chunk overlap: 512 - 64 = 448
     output_dir: str = "artifacts/encoders/deberta-v3-base"
     learning_rate: float = 2e-5
     num_train_epochs: int = 1  # Reduced from 3 for faster CPU training
-    train_batch_size: int = 8
-    eval_batch_size: int = 16
+    train_batch_size: int = 2  # Reduced from 8 for GPU memory
+    eval_batch_size: int = 4  # Reduced from 16 for GPU memory
     weight_decay: float = 0.01
+    gradient_accumulation_steps: int = 4  # Effective batch size = 2 * 4 = 8
     seed: int = 42
     max_samples: int = None  # Set to e.g. 1000 for quick testing
 
@@ -176,14 +178,13 @@ class DebertaPhishingEncoder:
         print(f"[Encoder] Loaded: train={len(train_df)}, eval={len(eval_df)}, test={len(test_df)}", flush=True)
 
         print("[Encoder] Loading tokenizer & model locally...", flush=True)
-        self.tokenizer = AutoTokenizer.from_pretrained(
+        # Use DebertaV2Tokenizer directly to avoid fast tokenizer issues
+        self.tokenizer = DebertaV2Tokenizer.from_pretrained(
             self.config.model_name,
-            local_files_only=True
         )
         self.model = AutoModelForSequenceClassification.from_pretrained(
             self.config.model_name,
             num_labels=2,
-            local_files_only=True
         )
 
         print("[Encoder] Building datasets (fast tokenization, no sliding window)...", flush=True)
@@ -207,14 +208,16 @@ class DebertaPhishingEncoder:
             per_device_train_batch_size=self.config.train_batch_size,
             per_device_eval_batch_size=self.config.eval_batch_size,
             num_train_epochs=self.config.num_train_epochs,
-            evaluation_strategy="epoch",
+            eval_strategy="epoch",  # Changed from evaluation_strategy
             save_strategy="epoch",
             load_best_model_at_end=True,
             learning_rate=self.config.learning_rate,
             weight_decay=self.config.weight_decay,
             logging_steps=50,
             report_to=[],
-            seed=self.config.seed
+            seed=self.config.seed,
+            gradient_accumulation_steps=self.config.gradient_accumulation_steps,
+            fp16=True,  # Use mixed precision to save memory
         )
 
         trainer = Trainer(
