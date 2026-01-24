@@ -10,7 +10,7 @@ from typing import Dict
 # Initialize the model pipeline (using 2b version for faster inference)
 pipe = pipeline(
     task="text-generation",
-    model="google/gemma-2-2b",
+    model="google/gemma-2-2b-it",
     dtype=torch.bfloat16,
     device_map="auto",
 )
@@ -33,26 +33,37 @@ def generate_phishing_analysis(
     Returns:
         str: Classification result ("phishing" or "safe")
     """
-    # Simple prompt format matching training data
-    prompt = f"""You are a security model. Classify the following email as 'phishing' or 'safe'. Reply with exactly one word: phishing or safe.
 
+    # Updated prompt to request explanation
+    prompt = f"""You are a security model. Classify the following email as 'phishing' or 'safe' and provide a detailed explanation for your decision.
+
+Email:
 {email_text}
 
-Classification:"""
+Your response should start with the classification ('phishing' or 'safe'), followed by a colon and then the explanation.
+Example: phishing: This email contains suspicious links and urgent language.
+"""
+
 
     # Generate response
     response = pipe(
         prompt,
-        max_new_tokens=10,  # Only need 1 word output
+        max_new_tokens=max_length,
         temperature=temperature,
         top_p=top_p,
         do_sample=True,
         return_full_text=False,
     )[0]["generated_text"]
-    
-    # Extract classification (first word)
-    result = response.strip().lower().split()[0] if response.strip() else "unknown"
-    return result
+
+    # Extract classification and explanation
+    if ":" in response:
+        classification, explanation = response.split(":", 1)
+        classification = classification.strip().lower()
+        explanation = explanation.strip()
+    else:
+        classification = response.strip().lower().split()[0] if response.strip() else "unknown"
+        explanation = response.strip()
+    return {"classification": classification, "explanation": explanation}
 
 # Singleton instance that can be imported by other modules
 model = pipe
