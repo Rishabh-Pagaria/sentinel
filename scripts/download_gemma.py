@@ -10,8 +10,8 @@ from huggingface_hub import snapshot_download
 
 def main():
     # Define model and local directory
-    model_id = "google/gemma-2-2b"
-    local_dir = "hf_models/gemma-2-2b"
+    model_id = "google/gemma-2-2b-it"
+    local_dir = "hf_models/gemma-2-2b-it"
     
     # Create directory if it doesn't exist
     os.makedirs(local_dir, exist_ok=True)
@@ -28,7 +28,7 @@ def main():
     
     print(f"[download_gemma] Downloading {model_id}...")
     print(f"[download_gemma] This may take several minutes (~5GB)")
-    print(f"[download_gemma] Note: You need to accept the license at https://huggingface.co/google/gemma-2-2b")
+    print(f"[download_gemma] Note: You need to accept the license at https://huggingface.co/google/gemma-2-2b-it")
     
     try:
         snapshot_download(
