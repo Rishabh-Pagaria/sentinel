@@ -1,7 +1,8 @@
 import os
 import re
 import json
-from typing import Dict
+from typing import Dict, List
+import warnings
 
 import pandas as pd
 from datasets import load_dataset
@@ -9,7 +10,9 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from bs4 import BeautifulSoup
 from sklearn.model_selection import train_test_split
+from bs4 import MarkupResemblesLocatorWarning
 
+warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 
 def load_phishing_data() -> pd.DataFrame:
     """
@@ -69,19 +72,84 @@ def visualize_data(df: pd.DataFrame, output_dir: str = "data/visualizations"):
     plt.close()
 
 
+def extract_html_features(html_text: str) -> Dict:
+    """Extract HTML-based phishing indicators"""
+    soup = BeautifulSoup(html_text, "html.parser")
+    
+    features = {
+        "link_mismatches": [],
+        "has_forms": False,
+        "has_scripts": False,
+        "suspicious_links": [],
+    }
+    
+    # Extract and analyze links
+    for a_tag in soup.find_all("a", href=True):
+        link_text = a_tag.get_text().strip().lower()
+        href = a_tag["href"].lower()
+        
+        # Check for link text vs URL mismatch (e.g., text says "paypal.com" but goes elsewhere)
+        common_brands = ["paypal", "bank", "amazon", "microsoft", "apple", "google", "ebay"]
+        for brand in common_brands:
+            if brand in link_text and brand not in href:
+                features["link_mismatches"].append({
+                    "text": link_text,
+                    "url": href,
+                    "brand": brand
+                })
+        
+        # Flag suspicious TLDs or obfuscated URLs
+        suspicious_tlds = [".ru", ".tk", ".ml", ".ga", ".cf", ".cn"]
+        if any(tld in href for tld in suspicious_tlds):
+            features["suspicious_links"].append(href)
+    
+    # Check for forms (credential harvesting)
+    features["has_forms"] = bool(soup.find_all("form"))
+    
+    # Check for scripts (potentially malicious)
+    features["has_scripts"] = bool(soup.find_all("script"))
+    
+    return features
+
+
+def detect_text_tactics(text: str) -> List[str]:
+    """Detect text-based phishing tactics using keywords"""
+    text_lower = text.lower()
+    tactics = []
+    
+    # Urgency tactics
+    urgency_words = ["urgent", "immediate", "suspended", "expire", "act now", "limited time"]
+    if any(word in text_lower for word in urgency_words):
+        tactics.append("urgency framing")
+    
+    # Credential requests
+    cred_words = ["verify", "confirm", "password", "account", "login", "credentials"]
+    if any(word in text_lower for word in cred_words):
+        tactics.append("credential harvesting")
+    
+    # Financial lures
+    financial_words = ["prize", "winner", "refund", "lottery", "claim", "$"]
+    if any(word in text_lower for word in financial_words):
+        tactics.append("financial lure")
+    
+    # Authority impersonation
+    authority_words = ["irs", "tax", "government", "federal", "court", "legal"]
+    if any(word in text_lower for word in authority_words):
+        tactics.append("authority impersonation")
+    
+    return list(set(tactics))  # Remove duplicates
+
+
 def prepare_data_for_classification(df: pd.DataFrame) -> pd.DataFrame:
     """
     Prepare data for classification:
-    - Remove HTML and normalize whitespace into 'cleaned_text'
+    - Keep raw HTML in 'text' column (NO cleaning)
+    - Normalize whitespace only
     - Keep labels as 0/1
     """
-    def clean_text(text: str) -> str:
-        text = BeautifulSoup(text, "html.parser").get_text()
-        text = re.sub(r"\s+", " ", text).strip()
-        return text
-
     df = df.copy()
-    df["cleaned_text"] = df["text"].apply(clean_text)
+    # Only normalize excessive whitespace, keep HTML tags
+    df["text"] = df["text"].apply(lambda x: re.sub(r"\s+", " ", str(x)).strip())
     df["label"] = df["label"].astype(int)
     return df
 
@@ -100,7 +168,7 @@ def create_jsonl_splits_for_slm(
     assert abs(train_ratio + eval_ratio + test_ratio - 1.0) < 1e-6
 
     os.makedirs(out_dir, exist_ok=True)
-    base_df = df[["cleaned_text", "label"]].dropna().reset_index(drop=True)
+    base_df = df[["text", "label"]].dropna().reset_index(drop=True)
 
     temp_ratio = eval_ratio + test_ratio
     train_df, temp_df = train_test_split(
@@ -118,17 +186,62 @@ def create_jsonl_splits_for_slm(
     )
 
     def write_jsonl(split_df: pd.DataFrame, path: str):
-        label_map = {1: "phishing", 0: "safe"}
         with open(path, "w", encoding="utf-8") as f:
             for _, row in split_df.iterrows():
+                # Get plain text for analysis
+                plain_text = BeautifulSoup(row["text"], "html.parser").get_text()
+                plain_text = re.sub(r"\s+", " ", plain_text).strip()
+                
+                # Extract HTML features
+                html_features = extract_html_features(row["text"])
+                
+                # Detect text-based tactics
+                text_tactics = detect_text_tactics(plain_text)
+                
+                # Build natural language explanation
+                label = "phishing" if row["label"] == 1 else "safe"
+                
+                if label == "phishing":
+                    # Build reason and tactics for phishing
+                    reasons = []
+                    all_tactics = []
+                    
+                    # HTML-based reasons
+                    if html_features["link_mismatches"]:
+                        mismatch = html_features["link_mismatches"][0]
+                        reasons.append(f"Link text mentions '{mismatch['brand']}' but redirects to '{mismatch['url']}'")
+                        all_tactics.append("link spoofing")
+                    
+                    if html_features["has_forms"]:
+                        reasons.append("Contains HTML forms requesting information")
+                        all_tactics.append("credential harvesting")
+                    
+                    if html_features["suspicious_links"]:
+                        reasons.append(f"Contains suspicious links to untrusted domains")
+                        all_tactics.append("malicious links")
+                    
+                    # Text-based tactics
+                    all_tactics.extend(text_tactics)
+                    
+                    # Generic reason if no specific features detected
+                    if not reasons:
+                        reasons.append("Contains typical phishing indicators")
+                    
+                    reason_text = ". ".join(reasons[:2]) + "."  # Limit to 2 main reasons
+                    
+                    # Format tactics list
+                    tactics_list = list(set(all_tactics))[:4]  # Max 4 unique tactics
+                    tactics_text = "\n".join([f"- {t.title()}" for t in tactics_list]) if tactics_list else "- Social engineering"
+                    
+                    output = f"This email is phishing.\n\nReason: {reason_text}\n\nTactics detected:\n{tactics_text}\n\nRecommendation: Do not click any links or provide personal information. Verify requests by contacting the organization directly through official channels."
+                else:
+                    # Safe email
+                    output = "This email is safe.\n\nReason: No suspicious indicators detected. Professional tone, legitimate content, no credential requests or urgency tactics.\n\nNo phishing tactics detected.\n\nRecommendation: This appears to be legitimate communication."
+                
                 record = {
-                    "instruction": (
-                        "You are a security model. "
-                        "Classify the following email as 'phishing' or 'safe'. "
-                        "Reply with exactly one word: phishing or safe."
-                    ),
-                    "input": row["cleaned_text"],
-                    "output": label_map[int(row["label"])],
+                    "instruction": "Analyze this email and determine if it's phishing or safe. Explain your reasoning.",
+                    "input": f"EMAIL: {row['text']}",  # Keep raw HTML in input
+                    "output": output,
                 }
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
