@@ -5,6 +5,7 @@ Provides a /classify endpoint that accepts email text and returns structured ana
 """
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Dict, Optional
 import google.generativeai as genai
@@ -17,8 +18,17 @@ load_dotenv()  # Load environment variables from .env file
 # Initialize FastAPI app
 app = FastAPI(
     title="Phishing Email Detector",
-    description="API for detecting phishing emails using Gemini 2.5 Flash",
+    description="API for detecting phishing emails using local models (DeBERTa & Gemma 2-2B)",
     version="1.0.0"
+)
+
+# Add CORS middleware for Gmail Add-on integration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, replace with specific origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Models for request/response
@@ -37,21 +47,23 @@ class ClassificationResponse(BaseModel):
     evidence: List[Evidence] = Field(default_factory=list, description="Evidence supporting the classification")
     user_tip: str = Field(..., description="User-friendly tip based on the analysis")
 
-# Initialize Gemini
+# TODO: Initialize local models (DeBERTa & Gemma 2-2B)
+# This section will be replaced with local model loading
+# Currently using Gemini as placeholder until local models are integrated
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY not found in .env file")
-
-genai.configure(api_key=GEMINI_API_KEY)
-# Using Gemini Flash 2.5 Lite for faster inference
-model = genai.GenerativeModel(model_name='models/gemini-2.5-flash-lite',
-                            generation_config={
-                                'temperature': 0.1,  # Low temperature for more focused outputs
-                                'top_p': 0.9,
-                                'top_k': 32,
-                                'max_output_tokens': 1024  # Limit output size for faster responses
-                            })
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    # Using Gemini Flash 2.5 Lite as temporary placeholder
+    model = genai.GenerativeModel(model_name='models/gemini-2.5-flash-lite',
+                                generation_config={
+                                    'temperature': 0.1,
+                                    'top_p': 0.9,
+                                    'top_k': 32,
+                                    'max_output_tokens': 1024
+                                })
+else:
+    model = None  # Will use local models when integrated
 
 # Response schema for Gemini
 RESPONSE_SCHEMA = {
