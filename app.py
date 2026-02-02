@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
 """
-FastAPI server for phishing email detection using Gemini 2.5 Flash.
-Provides a /classify endpoint that accepts email text and returns structured analysis.
+FastAPI server for phishing email detection using locally trained Gemma 2-2B-IT model with LoRA adapter.
+Provides a /classify endpoint that accepts email text and returns structured analysis with explanations.
 """
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Dict, Optional
-import google.generativeai as genai
+import torch
+from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
+from peft import PeftModel
 import os
 import json
+import logging
 from prep_phish_jsonl import clean_text, find_urls, find_phrases, infer_tactics
 from dotenv import load_dotenv
 
-load_dotenv()  # Load environment variables from .env file
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # Initialize FastAPI app
 app = FastAPI(
-    title="Phishing Email Detector",
-    description="API for detecting phishing emails using local models (DeBERTa & Gemma 2-2B)",
+    title="Phishing Email Detector - PhishGuard Lite",
+    description="API for detecting phishing emails using locally trained Gemma 2-2B-IT model",
     version="1.0.0"
 )
 
@@ -46,26 +52,51 @@ class ClassificationResponse(BaseModel):
     tactics: List[str] = Field(default_factory=list, description="List of detected phishing tactics")
     evidence: List[Evidence] = Field(default_factory=list, description="Evidence supporting the classification")
     user_tip: str = Field(..., description="User-friendly tip based on the analysis")
+    explanation: str = Field(..., description="Detailed explanation from the model")
 
-# TODO: Initialize local models (DeBERTa & Gemma 2-2B)
-# This section will be replaced with local model loading
-# Currently using Gemini as placeholder until local models are integrated
+# Initialize Gemma 2-2B-IT model with LoRA adapter
+BASE_MODEL = "hf_models/gemma-2-2b-it"
+LORA_ADAPTER_PATH = "artifacts/models/gemma-2-2b-phishing/new-checkpoint/checkpoint-1395"
+llm_pipe = None
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    # Using Gemini Flash 2.5 Lite as temporary placeholder
-    model = genai.GenerativeModel(model_name='models/gemini-2.5-flash-lite',
-                                generation_config={
-                                    'temperature': 0.1,
-                                    'top_p': 0.9,
-                                    'top_k': 32,
-                                    'max_output_tokens': 1024
-                                })
-else:
-    model = None  # Will use local models when integrated
+def load_model():
+    """Lazy load the model with LoRA adapter on first use"""
+    global llm_pipe
+    if llm_pipe is None:
+        try:
+            logger.info(f"Loading base model: {BASE_MODEL}")
+            # Load base model WITHOUT device_map (IMPORTANT: apply LoRA first, then move to device)
+            model = AutoModelForCausalLM.from_pretrained(
+                BASE_MODEL,
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True
+            )
+            
+            logger.info(f"Loading LoRA adapter from: {LORA_ADAPTER_PATH}")
+            # Load and merge LoRA adapter BEFORE moving to device
+            model = PeftModel.from_pretrained(model, LORA_ADAPTER_PATH)
+            
+            # Now move to appropriate device
+            if torch.cuda.is_available():
+                model = model.to("cuda")
+                logger.info("✓ Model moved to GPU")
+            else:
+                logger.info("✓ Model on CPU")
+            
+            logger.info("✓ Gemma 2-2B-IT model with LoRA adapter loaded successfully")
+            
+            # Create pipeline with the loaded model
+            llm_pipe = pipeline(
+                task="text-generation",
+                model=model,
+                tokenizer=AutoTokenizer.from_pretrained(BASE_MODEL)
+            )
+        except Exception as e:
+            logger.error(f"Failed to load model: {str(e)}")
+            raise
+    return llm_pipe
 
-# Response schema for Gemini
+# Response schema for Gemma
 RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -83,9 +114,10 @@ RESPONSE_SCHEMA = {
                 "required": ["span", "reason"]
             }
         },
-        "user_tip": {"type": "string"}
+        "user_tip": {"type": "string"},
+        "explanation": {"type": "string"}
     },
-    "required": ["label", "confidence", "tactics", "evidence", "user_tip"]
+    "required": ["label", "confidence", "tactics", "evidence", "user_tip", "explanation"]
 }
 
 SYSTEM_PROMPT = """You are a phishing detection expert. Analyze emails and output structured JSON only.
@@ -96,7 +128,8 @@ Format:
   "confidence": 0.0-1.0,
   "tactics": ["urgency", "credentials", "links"],
   "evidence": [{"span": "text", "reason": "why suspicious"}],
-  "user_tip": "security advice"
+  "user_tip": "security advice",
+  "explanation": "Detailed explanation of the classification decision"
 }
 
 Focus on:
@@ -114,9 +147,12 @@ __all__ = ['classify_email', 'EmailRequest']
 @app.post("/classify", response_model=ClassificationResponse)
 async def classify_email(request: EmailRequest):
     """
-    Analyze an email for phishing attempts and return structured analysis
+    Analyze an email for phishing attempts using Gemma 2-2B-IT model
     """
     try:
+        # Load model on first use
+        model = load_model()
+        
         # Clean and preprocess the text
         text = request.text
         subject = request.subject or ""
@@ -127,79 +163,97 @@ async def classify_email(request: EmailRequest):
         urls = find_urls(cleaned_text)
         phrases = find_phrases(cleaned_text)
         
-        # Prepare prompt for Gemini
-        email_prompt = f"""Email to analyze:
-Subject: {subject}
-Text: {cleaned_text}
-URLs found: {', '.join(urls) if urls else 'none'}
-Suspicious phrases: {', '.join(phrases) if phrases else 'none'}"""
+        # Prepare prompt for Gemma
+        email_prompt = f"""You are a phishing detection expert. Analyze the following email and provide a JSON response.
 
-        # Get Gemini's analysis
-        response = model.generate_content(
-            contents=[SYSTEM_PROMPT, email_prompt],
-            safety_settings=[
-                {
-                    "category": "HARM_CATEGORY_HARASSMENT",
-                    "threshold": "BLOCK_NONE"
-                },
-                {
-                    "category": "HARM_CATEGORY_HATE_SPEECH",
-                    "threshold": "BLOCK_NONE"
-                }
-            ]
+Email Subject: {subject}
+Email Body: {cleaned_text}
+
+Detected URLs: {', '.join(urls) if urls else 'none'}
+Suspicious phrases: {', '.join(phrases) if phrases else 'none'}
+
+Respond with ONLY a valid JSON object in this format:
+{{
+  "label": "phish" or "benign",
+  "confidence": 0.0-1.0,
+  "tactics": ["tactic1", "tactic2"],
+  "evidence": [{{"span": "text snippet", "reason": "why suspicious"}}],
+  "user_tip": "security advice",
+  "explanation": "detailed explanation"
+}}"""
+
+        # Generate analysis using Gemma
+        logger.info(f"Analyzing email: {subject[:50]}...")
+        response = model(
+            email_prompt,
+            max_new_tokens=512,
+            temperature=0.1,
+            top_p=0.9,
+            do_sample=True,
+            return_full_text=False,
         )
         
-        # Parse the response
-        response_text = response.text.strip()
+        response_text = response[0]["generated_text"].strip()
+        logger.info(f"Model response: {response_text[:200]}...")
         
-        # 1. Try to find JSON block if response contains other text
+        # Extract JSON from response
         if not response_text.startswith("{"):
             import re
-            # Look for JSON between curly braces, including nested structures
-            json_match = re.search(r'\{(?:[^{}]|(?R))*\}', response_text, re.DOTALL)
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if json_match:
                 response_text = json_match.group(0)
         
-        # 2. Clean up common JSON formatting issues
-        response_text = response_text.replace('\n', ' ')  # Remove newlines
-        response_text = re.sub(r',\s*}', '}', response_text)  # Remove trailing commas
-        response_text = re.sub(r',\s*]', ']', response_text)  # Remove trailing commas in arrays
+        # Clean up JSON
+        response_text = response_text.replace('\n', ' ')
+        response_text = re.sub(r',\s*}', '}', response_text)
+        response_text = re.sub(r',\s*]', ']', response_text)
         
         try:
-            # 3. Try to parse the JSON
             result = json.loads(response_text)
             
-            # 4. Ensure all required fields are present
-            required_fields = ["label", "confidence", "tactics", "evidence", "user_tip"]
-            missing_fields = [field for field in required_fields if field not in result]
+            # Ensure all required fields
+            required_fields = ["label", "confidence", "tactics", "evidence", "user_tip", "explanation"]
+            for field in required_fields:
+                if field not in result:
+                    if field == "label":
+                        result["label"] = "benign"
+                    elif field == "confidence":
+                        result["confidence"] = 0.5
+                    elif field in ["tactics", "evidence"]:
+                        result[field] = [] if field == "tactics" else []
+                    elif field == "user_tip":
+                        result["user_tip"] = "Review email carefully for suspicious content."
+                    elif field == "explanation":
+                        result["explanation"] = "Analysis completed."
             
-            if missing_fields:
-                # Provide default values for missing fields
-                if "label" not in result:
-                    result["label"] = "benign"
-                if "confidence" not in result:
-                    result["confidence"] = 0.5
-                if "tactics" not in result:
-                    result["tactics"] = []
-                if "evidence" not in result:
-                    result["evidence"] = []
-                if "user_tip" not in result:
-                    result["user_tip"] = "Analysis incomplete. Please review carefully."
+            # Ensure label is lowercase
+            result["label"] = result["label"].lower().strip()
             
             return ClassificationResponse(**result)
             
         except json.JSONDecodeError as e:
-            # If JSON parsing fails, return a safe fallback response
+            logger.error(f"JSON parsing failed: {str(e)}")
             return ClassificationResponse(
                 label="benign",
                 confidence=0.5,
                 tactics=[],
                 evidence=[],
-                user_tip="Unable to complete analysis. Please review manually."
+                user_tip="Unable to complete analysis. Please review manually.",
+                explanation="JSON parsing error in model response."
             )
         
     except Exception as e:
+        logger.error(f"Classification error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Classification failed: {str(e)}")
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for monitoring"""
+    return {
+        "status": "ok",
+        "service": "PhishGuard Lite",
+        "model": "Gemma 2-2B-IT"
+    }
 
 if __name__ == "__main__":
     import uvicorn
