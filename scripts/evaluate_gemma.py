@@ -112,13 +112,13 @@ def main():
     parser.add_argument(
         "--model_path",
         type=str,
-        default="artifacts/models/gemma-2-2b-phishing/new-checkpoint",
+        default="artifacts/models/gemma-2-2b-it-phishing",
         help="Path to fine-tuned model checkpoint",
     )
     parser.add_argument(
         "--base_model_path",
         type=str,
-        default="hf_models/gemma-2-2b",
+        default="hf_models/gemma-2-2b-it",
         help="Path to base Gemma model",
     )
     parser.add_argument(
@@ -148,7 +148,13 @@ def main():
         "--output_file",
         type=str,
         default="artifacts/models/gemma-2-2b-phishing/evaluation_results.json",
-        help="Where to save evaluation results",
+        help="Where to save evaluation results (JSON)",
+    )
+    parser.add_argument(
+        "--csv_file",
+        type=str,
+        default="artifacts/result.csv",
+        help="Where to save evaluation results (CSV)",
     )
     args = parser.parse_args()
 
@@ -172,8 +178,9 @@ def main():
     # Load tokenizer
     print("[evaluate_gemma] Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(
-        "google/gemma-2-2b-it",
+        args.base_model_path,
         trust_remote_code=True,
+        local_files_only=True,
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -232,18 +239,37 @@ def main():
     print(f"  [[TN={test_results['confusion_matrix'][0][0]}, FP={test_results['confusion_matrix'][0][1]}],")
     print(f"   [FN={test_results['confusion_matrix'][1][0]}, TP={test_results['confusion_matrix'][1][1]}]]")
 
-    # Save results
+    # Save results as JSON (original behavior)
     results = {
         "model_path": args.model_path,
         "eval_set": eval_results,
         "test_set": test_results,
     }
-    
     os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
     with open(args.output_file, 'w') as f:
         json.dump(results, f, indent=2)
-    
     print(f"\n[evaluate_gemma] Results saved to {args.output_file}")
+
+    # Save results as CSV (new behavior)
+    import csv
+    csv_path = args.csv_file
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    with open(csv_path, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["Set", "Accuracy", "Precision", "Recall", "F1", "TN", "FP", "FN", "TP", "Num Samples"])
+        for set_name, res in zip(["eval", "test"], [eval_results, test_results]):
+            cm = res["confusion_matrix"]
+            tn, fp = cm[0]
+            fn, tp = cm[1]
+            writer.writerow([
+                set_name,
+                f"{res['accuracy']:.4f}",
+                f"{res['precision']:.4f}",
+                f"{res['recall']:.4f}",
+                f"{res['f1']:.4f}",
+                tn, fp, fn, tp, res["num_samples"]
+            ])
+    print(f"[evaluate_gemma] CSV results saved to {csv_path}")
 
 
 if __name__ == "__main__":
