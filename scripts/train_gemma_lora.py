@@ -60,13 +60,13 @@ def main():
     parser.add_argument(
         "--train_file",
         type=str,
-        default="data/train_gemma.jsonl",
+        default="data/train_gemma_clean.jsonl",
         help="Path to training JSONL file",
     )
     parser.add_argument(
         "--eval_file",
         type=str,
-        default="data/eval_gemma.jsonl",
+        default="data/eval_gemma_clean.jsonl",
         help="Path to evaluation JSONL file",
     )
     parser.add_argument(
@@ -96,8 +96,8 @@ def main():
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=2e-4,
-        help="Learning rate",
+        default=5e-4,
+        help="Learning rate (higher for better convergence on clean data)",
     )
     args = parser.parse_args()
 
@@ -111,7 +111,7 @@ def main():
 
     # Load datasets
     print("[train_gemma] Loading datasets...")
-    dataset = load_dataset("json", data_files={"train": args.train_file, "test": args.eval_file})
+    dataset = load_dataset("json", data_files={"train": args.train_file, "eval": args.eval_file})
     
     # Convert to conversational format
     print("[train_gemma] Converting to conversational format...")
@@ -153,7 +153,7 @@ def main():
         desc="Tokenizing",
     )
     print(f"[train_gemma] Train samples: {len(tokenized_dataset['train'])}")
-    print(f"[train_gemma] Eval samples: {len(tokenized_dataset['test'])}")
+    print(f"[train_gemma] Eval samples: {len(tokenized_dataset['eval'])}")
 
     # Load model
     print("[train_gemma] Loading model...")
@@ -167,39 +167,44 @@ def main():
         attn_implementation="eager",  # flash_attention_2 not available on Windows
     )
 
-    # Configure LoRA (as per Google docs)
+    # Configure LoRA (tuned for clean, consistent training data)
     print("[train_gemma] Configuring LoRA...")
     peft_config = LoraConfig(
-        lora_alpha=16,
-        lora_dropout=0.05,
-        r=16,
+        lora_alpha=32,  # Increased from 16 for stronger adaptation
+        lora_dropout=0.1,  # Slightly higher for regularization
+        r=32,  # Increased from 16 for better capacity with clean data
         bias="none",
         target_modules="all-linear",  # Google recommends all-linear for Gemma
         task_type="CAUSAL_LM",
     )
 
     # Training arguments using SFTConfig
+    # Tuned for consistent output generation and better convergence
     training_args = SFTConfig(
         output_dir=args.output_dir,
         num_train_epochs=args.num_epochs,
         per_device_train_batch_size=args.batch_size,
-        gradient_accumulation_steps=32,  # Increased to maintain effective batch=32
+        gradient_accumulation_steps=32,  # Maintain effective batch size
         gradient_checkpointing=True,
-        # optim="paged_adamw_8bit" if args.use_qlora else "adamw_torch_fused",
         optim="adamw_torch_fused",
-        logging_steps=50,  # Reduced logging frequency (was 10)
-        save_strategy="steps",  # Save by steps instead of epoch
-        save_steps=200,  # Save every 200 steps (more frequent to avoid losing progress)
-        eval_strategy="no",  # Disable evaluation to avoid OOM
-        learning_rate=args.learning_rate,
+        logging_steps=50,
+        save_strategy="steps",
+        save_steps=200,
+        eval_strategy="steps",  # Enable evaluation on clean data
+        eval_steps=300,  # Evaluate every 300 steps
+        learning_rate=args.learning_rate,  # Higher LR for clean data
         bf16=True,
         max_grad_norm=0.3,
-        warmup_ratio=0.03,
-        lr_scheduler_type="constant",
-        max_seq_length=512,  # Explicit max length for speed
+        warmup_ratio=0.05,  # Slightly more warmup
+        lr_scheduler_type="linear",  # Linear decay instead of constant
+        max_seq_length=512,
         report_to=[],
-        dataloader_num_workers=0,  # Disable parallel loading on Windows (causes issues)
-        dataloader_pin_memory=False,  # Disable for stability
+        dataloader_num_workers=0,
+        dataloader_pin_memory=False,
+        seed=42,  # Fixed seed for reproducibility
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        load_best_model_at_end=True,  # Load best model at end of training
     )
 
     # Create SFTTrainer - use pre-tokenized dataset
@@ -218,6 +223,7 @@ def main():
         model=model,
         args=training_args,
         train_dataset=tokenized_dataset["train"],
+        eval_dataset=tokenized_dataset["eval"],
         peft_config=peft_config,
         processing_class=tokenizer,
         data_collator=data_collator,
