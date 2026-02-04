@@ -9,7 +9,6 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 # Single test email
 TEST_EMAIL = {
     "text": """URGENT! You have won $1,000,000 in the lottery! Send us your bank details and social security number to claim your prize NOW!""",
-    "expected": "phishing"
 }
 
 print("Loading Gemma-2-2b-it (instruction-tuned base model)...\n")
@@ -32,7 +31,7 @@ bnb_config = BitsAndBytesConfig(
 )
 
 model = AutoModelForCausalLM.from_pretrained(
-    "hf_models/gemma-2-2b-it",
+    "artifacts/gemma-2-2b-it-phishing",
     quantization_config=bnb_config,
     device_map="auto",
     local_files_only=True,
