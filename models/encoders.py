@@ -9,23 +9,23 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset as TorchDataset
-from sklearn.metrics import classification_report, accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import classification_report, accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, TrainingArguments, Trainer
 from transformers import DebertaV2Tokenizer
 
 
 @dataclass
 class EncoderConfig:
-    model_name: str = "microsoft/deberta-v3-base"   # <--- local model folder
-    max_length: int = 256  # Reduced from 512 for GPU memory
-    stride: int = 64                                 # chunk overlap: 512 - 64 = 448
+    model_name: str = "hf_models/deberta-v3-base"   # Local model folder
+    max_length: int = 512  # Full sequence length for GPU
+    stride: int = 64       # Chunk overlap for inference
     output_dir: str = "artifacts/encoders/deberta-v3-base"
     learning_rate: float = 2e-5
-    num_train_epochs: int = 1  # Reduced from 3 for faster CPU training
-    train_batch_size: int = 2  # Reduced from 8 for GPU memory
-    eval_batch_size: int = 4  # Reduced from 16 for GPU memory
+    num_train_epochs: int = 3  # Standard fine-tuning epochs
+    train_batch_size: int = 8  # GPU-optimized batch size
+    eval_batch_size: int = 16  # Larger eval batch for efficiency
     weight_decay: float = 0.01
-    gradient_accumulation_steps: int = 4  # Effective batch size = 2 * 4 = 8
+    gradient_accumulation_steps: int = 2  # Effective batch size = 8 * 2 = 16
     seed: int = 42
     max_samples: int = None  # Set to e.g. 1000 for quick testing
 
@@ -78,6 +78,11 @@ class DebertaPhishingEncoder:
 
     # ---------------------- Chunking -------------------------- #
     def _chunk_text(self, text: str):
+        """Tokenize text with proper handling for both single and multiple chunks"""
+        # Handle empty or invalid text
+        if not text or not isinstance(text, str):
+            text = ""
+        
         enc = self.tokenizer(
             text,
             truncation=True,
@@ -88,8 +93,21 @@ class DebertaPhishingEncoder:
         )
 
         chunks = []
-        for ids, attn in zip(enc["input_ids"], enc["attention_mask"]):
-            chunks.append({"input_ids": ids, "attention_mask": attn})
+        
+        # Handle both single chunk (dict with lists) and multiple chunks (list of dicts)
+        if "input_ids" in enc:
+            # Check if it's a list of sequences (multiple chunks) or single sequence
+            if isinstance(enc["input_ids"][0], list):
+                # Multiple chunks
+                for ids, attn in zip(enc["input_ids"], enc["attention_mask"]):
+                    chunks.append({"input_ids": ids, "attention_mask": attn})
+            else:
+                # Single chunk - input_ids is a flat list
+                chunks.append({
+                    "input_ids": enc["input_ids"],
+                    "attention_mask": enc["attention_mask"]
+                })
+        
         return chunks
 
     # ---------------------- PyTorch Dataset -------------------- #
@@ -119,10 +137,10 @@ class DebertaPhishingEncoder:
         
         all_input_ids = []
         all_attention_mask = []
-        batch_size = 100
+        batch_size = 50  # Smaller batches to avoid memory spikes
         
         for i in range(0, len(texts), batch_size):
-            if i % 1000 == 0:
+            if i % 500 == 0:
                 print(f"[Encoder] Tokenized {i}/{len(texts)}...", flush=True)
             
             batch_texts = texts[i:i+batch_size]
@@ -208,7 +226,7 @@ class DebertaPhishingEncoder:
             per_device_train_batch_size=self.config.train_batch_size,
             per_device_eval_batch_size=self.config.eval_batch_size,
             num_train_epochs=self.config.num_train_epochs,
-            eval_strategy="epoch",  # Changed from evaluation_strategy
+            eval_strategy="epoch",
             save_strategy="epoch",
             load_best_model_at_end=True,
             learning_rate=self.config.learning_rate,
@@ -217,7 +235,9 @@ class DebertaPhishingEncoder:
             report_to=[],
             seed=self.config.seed,
             gradient_accumulation_steps=self.config.gradient_accumulation_steps,
-            fp16=True,  # Use mixed precision to save memory
+            fp16=True,  # Mixed precision for faster training
+            dataloader_num_workers=2,  # Parallel data loading
+            save_total_limit=2,  # Keep only 2 best checkpoints to save space
         )
 
         trainer = Trainer(
@@ -237,8 +257,21 @@ class DebertaPhishingEncoder:
         trainer.save_model(self.config.output_dir)
         self.tokenizer.save_pretrained(self.config.output_dir)
 
-        print("[Encoder] Running evaluation on test set...", flush=True)
-        self.evaluate_on_dataframe(test_df)
+        # Evaluate on both eval and test sets
+        print("\n" + "="*80, flush=True)
+        print("FINAL EVALUATION", flush=True)
+        print("="*80, flush=True)
+        
+        eval_metrics = self.evaluate_on_dataframe(eval_df, split_name="eval")
+        test_metrics = self.evaluate_on_dataframe(test_df, split_name="test")
+        
+        # Save metrics to CSV
+        results_df = pd.DataFrame([eval_metrics, test_metrics])
+        csv_path = os.path.join(self.config.output_dir, "training_results.csv")
+        results_df.to_csv(csv_path, index=False)
+        print(f"\n[Encoder] Results saved to {csv_path}", flush=True)
+        print("\nFinal Results Summary:", flush=True)
+        print(results_df.to_string(index=False), flush=True)
 
     # ---------------------- Inference -------------------------- #
     def load(self):
@@ -247,22 +280,95 @@ class DebertaPhishingEncoder:
         return self
 
     def predict_proba_email(self, text: str):
+        """Predict phishing probability for an email text
+        
+        Args:
+            text: Email text to classify
+            
+        Returns:
+            Probability that the email is phishing (0.0 to 1.0)
+        """
         chunks = self._chunk_text(text)
+        
+        # If no chunks (empty text), return 0
+        if not chunks:
+            return 0.0
+        
         probs = []
+        
+        # Get device from model
+        device = next(self.model.parameters()).device
+        self.model.eval()
 
         with torch.no_grad():
             for c in chunks:
+                input_ids = torch.tensor([c["input_ids"]]).to(device)
+                attention_mask = torch.tensor([c["attention_mask"]]).to(device)
+                
                 logits = self.model(
-                    input_ids=torch.tensor([c["input_ids"]]),
-                    attention_mask=torch.tensor([c["attention_mask"]])
+                    input_ids=input_ids,
+                    attention_mask=attention_mask
                 ).logits
                 p = torch.softmax(logits, dim=-1)[0, 1].item()
                 probs.append(p)
 
-        return max(probs)
+        return max(probs) if probs else 0.0
 
-    def evaluate_on_dataframe(self, df):
+    def evaluate_on_dataframe(self, df, split_name="test"):
+        """Evaluate model on a dataframe with detailed metrics
+        
+        Args:
+            df: DataFrame with 'text' and 'label' columns
+            split_name: Name of the split (e.g., 'eval', 'test')
+            
+        Returns:
+            Dictionary with metrics
+        """
+        print(f"\n[Encoder] Evaluating {split_name} set ({len(df)} samples)...", flush=True)
         y_true = df["label"].tolist()
-        y_pred = [1 if self.predict_proba_email(t) >= 0.5 else 0 for t in df["text"].tolist()]
-
-        print(classification_report(y_true, y_pred, digits=4))
+        y_pred = []
+        
+        # Batch evaluation for efficiency
+        for i, text in enumerate(df["text"].tolist()):
+            if (i + 1) % 100 == 0:
+                print(f"[Encoder] Evaluated {i + 1}/{len(df)} samples...", flush=True)
+            pred = 1 if self.predict_proba_email(text) >= 0.5 else 0
+            y_pred.append(pred)
+        
+        # Calculate metrics
+        accuracy = accuracy_score(y_true, y_pred)
+        precision = precision_score(y_true, y_pred, zero_division=0)
+        recall = recall_score(y_true, y_pred, zero_division=0)
+        f1 = f1_score(y_true, y_pred, zero_division=0)
+        
+        # Confusion matrix
+        cm = confusion_matrix(y_true, y_pred)
+        tn, fp, fn, tp = cm.ravel()
+        
+        # Print detailed results
+        print(f"\n{'='*60}", flush=True)
+        print(f"{split_name.upper()} SET RESULTS", flush=True)
+        print(f"{'='*60}", flush=True)
+        print(f"Accuracy:  {accuracy:.4f}", flush=True)
+        print(f"Precision: {precision:.4f}", flush=True)
+        print(f"Recall:    {recall:.4f}", flush=True)
+        print(f"F1 Score:  {f1:.4f}", flush=True)
+        print(f"\nConfusion Matrix:", flush=True)
+        print(f"  TN: {tn:4d}  |  FP: {fp:4d}", flush=True)
+        print(f"  FN: {fn:4d}  |  TP: {tp:4d}", flush=True)
+        print(f"\nClassification Report:", flush=True)
+        print(classification_report(y_true, y_pred, digits=4), flush=True)
+        
+        # Return metrics dict for CSV export
+        return {
+            'Set': split_name,
+            'Accuracy': accuracy,
+            'Precision': precision,
+            'Recall': recall,
+            'F1': f1,
+            'TN': int(tn),
+            'FP': int(fp),
+            'FN': int(fn),
+            'TP': int(tp),
+            'Num Samples': len(df)
+        }
