@@ -98,9 +98,9 @@ class ClassificationResponse(BaseModel):
     fusion_info: Optional[Dict] = Field(None, description="Transparency info about fusion (debugging)")
 
 # Model paths
-DEBERTA_MODEL_PATH = "artifacts/models/deberta-phishing/deberta-phishing"
-GEMMA_BASE_MODEL = "hf_models/gemma-2-2b-it"
-GEMMA_LORA_ADAPTER = "artifacts/models/gemma-2-2b-it-final_v2"
+DEBERTA_MODEL_PATH = "rishabhpagaria/deberta_phishing"
+GEMMA_BASE_MODEL = "google/gemma-2-2b-it"
+GEMMA_LORA_ADAPTER = "rishabhpagaria/gemma-2-2b-it_phishing"
 
 # Global model instances (lazy loaded)
 deberta_model = None
@@ -114,23 +114,24 @@ def load_deberta():
     global deberta_model, deberta_tokenizer
     if deberta_model is None:
         try:
-            logger.info(f"Loading Deberta model from: {DEBERTA_MODEL_PATH}")
-            deberta_tokenizer = AutoTokenizer.from_pretrained(DEBERTA_MODEL_PATH)
+            logger.info(f"Loading Deberta fine-tuned model: {DEBERTA_MODEL_PATH}")
+            deberta_tokenizer = AutoTokenizer.from_pretrained(DEBERTA_MODEL_PATH, trust_remote_code=True)
             deberta_model = AutoModelForSequenceClassification.from_pretrained(
                 DEBERTA_MODEL_PATH,
-                torch_dtype=torch.float32
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True
             )
+            deberta_model.eval()
             
             if torch.cuda.is_available():
                 deberta_model = deberta_model.to("cuda")
-                logger.info("✓ Deberta moved to GPU")
+                logger.info("✓ DeBERTa moved to GPU")
             else:
-                logger.info("✓ Deberta on CPU")
+                logger.info("✓ DeBERTa on CPU")
             
-            deberta_model.eval()  # Set to evaluation mode
-            logger.info("✓ Deberta model loaded successfully")
+            logger.info("✓ DeBERTa fine-tuned model loaded successfully")
         except Exception as e:
-            logger.error(f"Failed to load Deberta: {str(e)}")
+            logger.error(f"Failed to load DeBERTa: {str(e)}")
             raise
     return deberta_model, deberta_tokenizer
 
@@ -145,8 +146,7 @@ def load_gemma():
             # Load tokenizer from base model
             gemma_tokenizer = AutoTokenizer.from_pretrained(
                 GEMMA_BASE_MODEL, 
-                trust_remote_code=True, 
-                local_files_only=True
+                trust_remote_code=True
             )
             if gemma_tokenizer.pad_token is None:
                 gemma_tokenizer.pad_token = gemma_tokenizer.eos_token
@@ -157,8 +157,7 @@ def load_gemma():
                 GEMMA_BASE_MODEL,
                 torch_dtype=torch.bfloat16,
                 device_map="auto",
-                trust_remote_code=True,
-                local_files_only=True
+                trust_remote_code=True
             )
             
             # NO LoRA adapter - using base instruction-tuned model only
