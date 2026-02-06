@@ -18,41 +18,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 
-def create_conversation(sample):
-    """
-    Convert JSONL sample to conversational format for SFTTrainer.
-    SFTTrainer expects 'messages' format with role-based conversation.
-    """
-    return {
-        "messages": [
-            {"role": "user", "content": f"{sample['instruction']}\n\n{sample['input']}"},
-            {"role": "assistant", "content": sample['output']}
-        ]
-    }
-
-
-def tokenize_function(examples, tokenizer):
-    """
-    Pre-tokenize dataset to avoid on-the-fly tokenization during training.
-    This is the BIGGEST speed optimization - tokenizing once vs every batch.
-    """
-    # Apply chat template
-    texts = [tokenizer.apply_chat_template(msg, tokenize=False, add_generation_prompt=False) 
-             for msg in examples["messages"]]
-    
-    # Tokenize with truncation only - NO padding (save memory)
-    tokenized = tokenizer(
-        texts,
-        max_length=512,  # Limit sequence length for speed
-        truncation=True,
-        padding=False,  # Dynamic padding in data collator saves memory
-        return_tensors=None,
-    )
-    
-    # For causal LM, labels are the same as input_ids
-    tokenized["labels"] = tokenized["input_ids"].copy()
-    
-    return tokenized
+# Note: Helper functions removed - using pre-formatted template data instead
 
 
 def main():
@@ -60,14 +26,20 @@ def main():
     parser.add_argument(
         "--train_file",
         type=str,
-        default="data/train_gemma_clean.jsonl",
-        help="Path to training JSONL file",
+        default="data/train_gemma_template.jsonl",
+        help="Path to training JSONL file (must be in Gemma chat template format)",
     )
     parser.add_argument(
         "--eval_file",
         type=str,
-        default="data/eval_gemma_clean.jsonl",
-        help="Path to evaluation JSONL file",
+        default="data/eval_gemma_template.jsonl",
+        help="Path to evaluation JSONL file (must be in Gemma chat template format)",
+    )
+    parser.add_argument(
+        "--test_file",
+        type=str,
+        default="data/test_gemma_template.jsonl",
+        help="Path to test JSONL file (must be in Gemma chat template format)",
     )
     parser.add_argument(
         "--model_path",
@@ -78,7 +50,7 @@ def main():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="artifacts/models/gemma-2-2b-it-phishing",
+        default="artifacts/models/gemma-2-2b-it-final",
         help="Where to save the fine-tuned model",
     )
     parser.add_argument(
@@ -109,13 +81,22 @@ def main():
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Load datasets
-    print("[train_gemma] Loading datasets...")
-    dataset = load_dataset("json", data_files={"train": args.train_file, "eval": args.eval_file})
+    # Load datasets (already in Gemma chat template format)
+    print("[train_gemma] Loading datasets (template format)...")
+    train_dataset = load_dataset("json", data_files=args.train_file, split="train")
+    eval_dataset = load_dataset("json", data_files=args.eval_file, split="train")
+    test_dataset = load_dataset("json", data_files=args.test_file, split="train")
     
-    # Convert to conversational format
-    print("[train_gemma] Converting to conversational format...")
-    dataset = dataset.map(create_conversation, remove_columns=list(dataset["train"].features), batched=False)
+    print(f"[train_gemma] Train samples: {len(train_dataset)}")
+    print(f"[train_gemma] Eval samples: {len(eval_dataset)}")
+    print(f"[train_gemma] Test samples: {len(test_dataset)}")
+    
+    # Combine datasets for SFTTrainer
+    from datasets import DatasetDict
+    dataset = DatasetDict({
+        "train": train_dataset,
+        "eval": eval_dataset
+    })
     
     # Configure quantization for QLoRA if enabled
     # if args.use_qlora:
@@ -132,8 +113,10 @@ def main():
 
     # Load tokenizer from instruction-tuned version (has chat template)
     print("[train_gemma] Loading tokenizer...")
+    # Convert path to proper format for tokenizer
+    model_path_obj = Path(args.model_path)
     tokenizer = AutoTokenizer.from_pretrained(
-      args.model_path,  # Use same path as model
+        str(model_path_obj),  # Use string representation
         trust_remote_code=True,
         local_files_only=True,
     )
@@ -143,22 +126,10 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    # PRE-TOKENIZE DATASET (CRITICAL FOR SPEED)
-    print("[train_gemma] Pre-tokenizing dataset (this is crucial for training speed)...")
-    tokenized_dataset = dataset.map(
-        lambda x: tokenize_function(x, tokenizer),
-        batched=True,
-        batch_size=1000,
-        remove_columns=dataset["train"].column_names,
-        desc="Tokenizing",
-    )
-    print(f"[train_gemma] Train samples: {len(tokenized_dataset['train'])}")
-    print(f"[train_gemma] Eval samples: {len(tokenized_dataset['eval'])}")
-
     # Load model
     print("[train_gemma] Loading model...")
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
+        str(model_path_obj),  # Use string representation
         quantization_config=bnb_config,
         device_map="auto",
         local_files_only=True,
@@ -179,7 +150,10 @@ def main():
     )
 
     # Training arguments using SFTConfig
-    # Tuned for consistent output generation and better convergence
+    # CRITICAL FIXES for Gemma-2 (from research findings):
+    # 1. bf16=True: Use bfloat16 instead of float16 (prevents NaN issues)
+    # 2. packing=True: Pack sequences to avoid padding token NaN bug
+    # 3. Chat template format: Data already formatted with <start_of_turn> tags
     training_args = SFTConfig(
         output_dir=args.output_dir,
         num_train_epochs=args.num_epochs,
@@ -189,11 +163,12 @@ def main():
         optim="adamw_torch_fused",
         logging_steps=50,
         save_strategy="steps",
-        save_steps=200,
+        save_steps=300,  # Must be multiple of eval_steps
         eval_strategy="steps",  # Enable evaluation on clean data
         eval_steps=300,  # Evaluate every 300 steps
         learning_rate=args.learning_rate,  # Higher LR for clean data
-        bf16=True,
+        bf16=True,  # CRITICAL: Use bfloat16, not float16 (Gemma-2 requirement)
+        packing=True,  # CRITICAL: Pack sequences to avoid padding NaN bug
         max_grad_norm=0.3,
         warmup_ratio=0.05,  # Slightly more warmup
         lr_scheduler_type="linear",  # Linear decay instead of constant
@@ -207,26 +182,17 @@ def main():
         load_best_model_at_end=True,  # Load best model at end of training
     )
 
-    # Create SFTTrainer - use pre-tokenized dataset
+    # Create SFTTrainer with template-formatted data
     print("[train_gemma] Setting up SFTTrainer...")
-    from transformers import DataCollatorForSeq2Seq
-    
-    # Use DataCollatorForSeq2Seq for dynamic padding (memory efficient)
-    data_collator = DataCollatorForSeq2Seq(
-        tokenizer=tokenizer,
-        model=model,
-        padding=True,  # Pad dynamically to longest in batch
-        return_tensors="pt",
-    )
+    print("[train_gemma] Using Gemma chat template format with packing enabled")
     
     trainer = SFTTrainer(
         model=model,
         args=training_args,
-        train_dataset=tokenized_dataset["train"],
-        eval_dataset=tokenized_dataset["eval"],
+        train_dataset=dataset["train"],
+        eval_dataset=dataset["eval"],
         peft_config=peft_config,
         processing_class=tokenizer,
-        data_collator=data_collator,
     )
 
     # Train (resume from checkpoint if it exists)
@@ -248,6 +214,10 @@ def main():
     tokenizer.save_pretrained(args.output_dir)
 
     print(f"[train_gemma] Training complete! Model saved to {args.output_dir}")
+    
+    # Note: Test dataset can be used separately for evaluation
+    print(f"[train_gemma] Test dataset available at: {args.test_file}")
+    print(f"[train_gemma] Use evaluate scripts to assess test performance")
 
 
 if __name__ == "__main__":
