@@ -41,7 +41,6 @@ artifacts/
 # Temporary/misc files
 gmflow_depth_vitb_conv4_DINOV2_naf_both_f4_f8_chairs_refine.sh
 hf_download.py
-gmail_addon/
 
 # IDE
 .idea/
